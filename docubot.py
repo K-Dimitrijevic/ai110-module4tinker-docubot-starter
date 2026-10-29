@@ -9,6 +9,21 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import string
+
+# Common words that carry no topic meaning. They are ignored when scoring,
+# so a question can't "match" a section just by sharing words like "how" or "the".
+STOPWORDS = {
+    "a", "an", "and", "any", "are", "as", "at", "be", "by", "can", "do",
+    "does", "for", "from", "how", "i", "in", "is", "it", "me", "mention",
+    "my", "of", "on", "or", "the", "there", "these", "this", "to", "what",
+    "when", "where", "which", "who", "why", "with", "docs",
+}
+
+# Refusal guardrail: a section must contain at least this many of the
+# question's meaningful (non-stopword) words to count as evidence. Below that,
+# retrieve() returns nothing and the answer methods say "I do not know".
+MIN_SCORE = 1
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -22,8 +37,11 @@ class DocuBot:
         # Load documents into memory
         self.documents = self.load_documents()  # List of (filename, text)
 
+        # Split documents into heading-based sections
+        self.sections = self.split_into_sections(self.documents)  # List of (filename, section_text)
+
         # Build a retrieval index (implemented in Phase 1)
-        self.index = self.build_index(self.documents)
+        self.index = self.build_index(self.sections)
 
     # -----------------------------------------------------------
     # Document Loading
@@ -44,6 +62,42 @@ class DocuBot:
                 docs.append((filename, text))
         return docs
 
+    def split_into_sections(self, documents):
+        """
+        Splits each document into sections at Markdown headings.
+        Each section is a heading plus everything under it, up to the next heading.
+        Returns a list of tuples: (filename, section_text)
+        """
+        # Called once from __init__ with the output of load_documents().
+        # The result is stored in self.sections, which build_index() and
+        # retrieve() search instead of whole files.
+        sections = []
+
+        for filename, text in documents:
+            current = []        # Lines of the section being built
+            in_code_block = False
+
+            for line in text.splitlines():
+                # Track ``` fences so a "#" comment inside a code block
+                # is not mistaken for a heading.
+                if line.strip().startswith("```"):
+                    in_code_block = not in_code_block
+
+                # A line starting with "#" (outside code) begins a new section,
+                # so save the lines collected so far as a finished section.
+                if line.startswith("#") and not in_code_block and current:
+                    sections.append((filename, "\n".join(current).strip()))
+                    current = []
+
+                current.append(line)
+
+            # Save the last section of the file (there's no heading after it).
+            if current:
+                sections.append((filename, "\n".join(current).strip()))
+
+        # Drop sections that ended up empty (e.g. only blank lines).
+        return [(filename, text) for filename, text in sections if text]
+
     # -----------------------------------------------------------
     # Index Construction (Phase 1)
     # -----------------------------------------------------------
@@ -63,8 +117,34 @@ class DocuBot:
         Keep this simple: split on whitespace, lowercase tokens,
         ignore punctuation if needed.
         """
+        # Called once from __init__ with the (filename, section_text) list
+        # produced by split_into_sections(). The result is stored in self.index
+        # and later used by retrieve() to quickly find which sections mention
+        # a query word. Each word maps to section positions (0, 1, 2, ...) in
+        # self.sections, since one file now has many sections.
         index = {}
-        # TODO: implement simple indexing
+
+        # Walk every section, and every whitespace-separated word inside it.
+        # enumerate() gives each section's position alongside its contents.
+        for position, (_, text) in enumerate(documents):
+            for word in text.split():
+                # Normalize the word: lowercase and strip surrounding punctuation,
+                # so "Token," and "token" map to the same key. score_document()
+                # and retrieve() normalize words the same way so lookups match.
+                token = word.lower().strip(string.punctuation)
+
+                # Skip words that were pure punctuation (e.g. "---", "#").
+                if not token:
+                    continue
+
+                # Create an empty section list the first time we see this word.
+                if token not in index:
+                    index[token] = []
+
+                # Record this section under the word, only once per section.
+                if position not in index[token]:
+                    index[token].append(position)
+
         return index
 
     # -----------------------------------------------------------
@@ -81,8 +161,36 @@ class DocuBot:
         - Count how many appear in the text
         - Return the count as the score
         """
-        # TODO: implement scoring
-        return 0
+        # Called by retrieve() for each candidate document to rank it.
+
+        # Normalize the document's words (same rules as build_index) and put
+        # them in a set for fast "is this word present?" checks.
+        text_words = set(
+            word.lower().strip(string.punctuation) for word in text.split()
+        )
+
+        # Count how many meaningful query words appear in the document.
+        # Stopwords are skipped, and each distinct word counts once.
+        score = 0
+        for token in self.meaningful_words(query):
+            if token in text_words:
+                score += 1
+
+        # Higher score = more query words matched = more relevant.
+        return score
+
+    def meaningful_words(self, text):
+        """
+        Returns the set of normalized words in text, minus STOPWORDS.
+        """
+        # Used by score_document() and retrieve() so both agree on which
+        # query words count as evidence.
+        words = set()
+        for word in text.split():
+            token = word.lower().strip(string.punctuation)
+            if token and token not in STOPWORDS:
+                words.add(token)
+        return words
 
     def retrieve(self, query, top_k=3):
         """
@@ -91,8 +199,42 @@ class DocuBot:
 
         Return a list of (filename, text) sorted by score descending.
         """
+        # Used by answer_retrieval_only() (Phase 1), answer_rag() (Phase 2,
+        # which passes the results to llm_client.answer_from_snippets), and
+        # evaluation.py (which checks the returned filenames for hit rate).
         results = []
-        # TODO: implement retrieval logic
+
+        # Guardrail: if the question has no meaningful words (e.g. "how do i?"),
+        # there is nothing to look for, so refuse right away.
+        query_words = self.meaningful_words(query)
+        if not query_words:
+            return []
+
+        # Step 1: use self.index (built by build_index) to collect the
+        # positions of sections that contain at least one meaningful query
+        # word. Unknown words return [].
+        candidates = set()
+        for token in query_words:
+            candidates.update(self.index.get(token, []))
+
+        # Step 2: score only the candidate sections with score_document().
+        # self.sections comes from split_into_sections(). Guardrail: sections
+        # below MIN_SCORE are dropped, so matches on filler words alone never
+        # reach the answer methods or the LLM.
+        for position in candidates:
+            filename, text = self.sections[position]
+            score = self.score_document(query, text)
+            if score >= MIN_SCORE:
+                results.append((score, filename, text))
+
+        # Step 3: sort best matches first, then drop the score so callers get
+        # the (filename, text) pairs they expect.
+        results.sort(key=lambda item: item[0], reverse=True)
+        results = [(filename, text) for _, filename, text in results]
+
+        # Step 4: keep only the top_k results. An empty list (no meaningful
+        # evidence) makes the answer methods reply "I do not know based on
+        # these docs." instead of guessing.
         return results[:top_k]
 
     # -----------------------------------------------------------
